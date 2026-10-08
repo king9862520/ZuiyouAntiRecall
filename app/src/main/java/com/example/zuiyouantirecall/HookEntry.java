@@ -67,7 +67,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
             XposedHelpers.findAndHookMethod(Application.class, "attach", Context.class, new XC_MethodHook() {
                 @Override protected void afterHookedMethod(MethodHookParam p) {
                     appContext = (Context) p.args[0];
-                    report("app.attach process=main");
+                    report("app.attach process=main module=v11");
                 }
             });
             Class<?> activity = Class.forName("cn.xiaochuankeji.tieba.ui.chat.ChatActivity", false, lpparam.classLoader);

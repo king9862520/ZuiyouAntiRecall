@@ -30,7 +30,9 @@ public final class DiagnosticLogProvider extends ContentProvider {
     @Override public Uri insert(Uri uri, ContentValues values) {
         if (!URI.equals(uri) || getContext() == null || !isAllowedCaller()) return null;
         String event = values == null ? null : values.getAsString("event");
-        if (event == null || !event.matches("[A-Za-z0-9_.:= -]{1,160}")) return null;
+        // V11: allow sanitized stack chain separators (>), nested class markers ($), and
+        // longer diagnostic records emitted by V10. Still reject newlines and free text.
+        if (event == null || !event.matches("[A-Za-z0-9_.$:=> -]{1,1400}")) return null;
         String line = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(new Date())
                 + " " + event + "\n";
         synchronized (LOCK) {
