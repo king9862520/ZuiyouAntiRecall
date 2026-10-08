@@ -64,6 +64,9 @@ public final class HookEntry implements IXposedHookLoadPackage {
     private static final AtomicInteger v14ResponseSequence = new AtomicInteger();
     private static volatile long v14RecentMatchResponseMs = 0;
     private static volatile String v14RecentMatchClick = "unlinked";
+    // V15 only tracks the local click number and time, never chat target or request data.
+    private static volatile long v15CheckStartedMs = 0;
+    private static volatile String v15CheckClick = "unlinked";
     private static final class V14RouteInfo {
         final String reason;
         final String family;
@@ -103,7 +106,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
             XposedHelpers.findAndHookMethod(Application.class, "attach", Context.class, new XC_MethodHook() {
                 @Override protected void afterHookedMethod(MethodHookParam p) {
                     appContext = (Context) p.args[0];
-                    report("app.attach process=main module=v14");
+                    report("app.attach process=main module=v15");
                 }
             });
             Class<?> activity = Class.forName("cn.xiaochuankeji.tieba.ui.chat.ChatActivity", false, lpparam.classLoader);
@@ -350,6 +353,150 @@ public final class HookEntry implements IXposedHookLoadPackage {
         report("paperplane.v8.precise_setup.end");
         setupV9DecisionTrace(loader);
         setupV14MatchUiObservation();
+        setupV15ChatEligibilityTrace(loader);
+    }
+
+
+    /** V15: read-only checkpoints verified against the 7.3.19.2 DEX methods.
+     *  No IDs, target usernames, request JSON, result objects or exception messages.
+     *  These hooks never call setResult / setThrowable and never edit arguments. */
+    private static void setupV15ChatEligibilityTrace(ClassLoader loader) {
+        int hooks = 0;
+        try {
+            Class<?> caller = Class.forName("ar3", false, loader);
+            for (Method method : caller.getDeclaredMethods()) {
+                if (!"y".equals(method.getName()) || method.getParameterTypes().length != 0) continue;
+                XposedBridge.hookMethod(method, new XC_MethodHook() {
+                    @Override protected void beforeHookedMethod(MethodHookParam p) {
+                        if (!setting("paper_enabled") || "none".equals(clickContext())) return;
+                        reportOnce("v15_click_chain_" + clickContext(),
+                            "paperplane.v15.chat_chain stage=ar3_y click=" + clickContext(), 500);
+                    }
+                });
+                hooks++;
+            }
+        } catch (Throwable t) {
+            report("paperplane.v15.hook_ar3 unavailable=" + safeType(t));
+        }
+        try {
+            Class<?> check = Class.forName("sz1", false, loader);
+            for (Method method : check.getDeclaredMethods()) {
+                Class<?>[] types = method.getParameterTypes();
+                if (!"d".equals(method.getName()) || types.length != 4
+                    || !Context.class.isAssignableFrom(types[0])
+                    || types[1] != String.class || types[2] != Long.TYPE
+                    || !"zdf".equals(types[3].getName())) continue;
+                XposedBridge.hookMethod(method, new XC_MethodHook() {
+                    @Override protected void beforeHookedMethod(MethodHookParam p) {
+                        if (!setting("paper_enabled") || "none".equals(clickContext())) return;
+                        v15RememberCheck();
+                        reportOnce("v15_sz1_" + v15RecentClick(),
+                            "paperplane.v15.chat_check stage=sz1_d click=" + v15RecentClick(), 900);
+                    }
+                });
+                hooks++;
+            }
+        } catch (Throwable t) {
+            report("paperplane.v15.hook_sz1 unavailable=" + safeType(t));
+        }
+        try {
+            Class<?> apiWrapper = Class.forName("zi", false, loader);
+            for (Method method : apiWrapper.getDeclaredMethods()) {
+                Class<?>[] types = method.getParameterTypes();
+                if (!"b".equals(method.getName()) || types.length != 2
+                    || types[0] != String.class || types[1] != Long.TYPE) continue;
+                XposedBridge.hookMethod(method, new XC_MethodHook() {
+                    @Override protected void beforeHookedMethod(MethodHookParam p) {
+                        if (!setting("paper_enabled") || "none".equals(clickContext())) return;
+                        v15RememberCheck();
+                        reportOnce("v15_zi_" + v15RecentClick(),
+                            "paperplane.v15.chat_check stage=zi_b_request_wrapper click="
+                                + v15RecentClick(), 900);
+                    }
+                });
+                hooks++;
+            }
+        } catch (Throwable t) {
+            report("paperplane.v15.hook_zi unavailable=" + safeType(t));
+        }
+        try {
+            Class<?> callback = Class.forName("sz1$a", false, loader);
+            for (Method method : callback.getDeclaredMethods()) {
+                Class<?>[] types = method.getParameterTypes();
+                if ("onFail".equals(method.getName()) && types.length == 1
+                    && types[0] == Throwable.class) {
+                    XposedBridge.hookMethod(method, new XC_MethodHook() {
+                        @Override protected void beforeHookedMethod(MethodHookParam p) {
+                            if (!setting("paper_enabled")) return;
+                            String click = v15RecentClick();
+                            if ("unlinked".equals(click)) return;
+                            Throwable error = p.args.length > 0 && p.args[0] instanceof Throwable
+                                ? (Throwable)p.args[0] : null;
+                            reportOnce("v15_check_fail_" + click,
+                                "paperplane.v15.chat_check stage=callback_fail click=" + click
+                                    + " type=" + safeType(error)
+                                    + " quota_text=" + (error != null && isQuotaPrompt(error.getMessage()))
+                                    + " ret=" + v12ErrorCode(error), 900);
+                        }
+                    });
+                    hooks++;
+                } else if ("a".equals(method.getName()) && types.length == 1
+                    && "u6c".equals(types[0].getName())) {
+                    // Direct success handler, rather than bridge onSuccess(Object).
+                    XposedBridge.hookMethod(method, new XC_MethodHook() {
+                        @Override protected void beforeHookedMethod(MethodHookParam p) {
+                            if (!setting("paper_enabled")) return;
+                            String click = v15RecentClick();
+                            if ("unlinked".equals(click)) return;
+                            reportOnce("v15_check_success_" + click,
+                                "paperplane.v15.chat_check stage=callback_success_handler click=" + click, 900);
+                        }
+                    });
+                    hooks++;
+                }
+            }
+        } catch (Throwable t) {
+            report("paperplane.v15.hook_callback unavailable=" + safeType(t));
+        }
+        try {
+            Class<?> chat = Class.forName("vz1", false, loader);
+            for (Method method : chat.getDeclaredMethods()) {
+                Class<?>[] types = method.getParameterTypes();
+                if (!"u".equals(method.getName()) || types.length != 2
+                    || !Context.class.isAssignableFrom(types[0])
+                    || !"cn.xiaochuankeji.tieba.networking.data.NearbyPlaneDataBean"
+                        .equals(types[1].getName())) continue;
+                XposedBridge.hookMethod(method, new XC_MethodHook() {
+                    @Override protected void beforeHookedMethod(MethodHookParam p) {
+                        if (!setting("paper_enabled")) return;
+                        String click = v15RecentClick();
+                        if ("unlinked".equals(click)) return;
+                        reportOnce("v15_prepare_" + click,
+                            "paperplane.v15.chat_check stage=vz1_u_prepare click=" + click, 900);
+                    }
+                });
+                hooks++;
+            }
+        } catch (Throwable t) {
+            report("paperplane.v15.hook_vz1 unavailable=" + safeType(t));
+        }
+        report("paperplane.v15.check_hooks=" + hooks);
+    }
+
+    private static void v15RememberCheck() {
+        // A live observed UI click is required before associating a check attempt.
+        String click = clickContext();
+        if ("none".equals(click)) return;
+        v15CheckClick = click;
+        v15CheckStartedMs = android.os.SystemClock.elapsedRealtime();
+    }
+
+    private static String v15RecentClick() {
+        String click = clickContext();
+        if (!"none".equals(click)) return click;
+        long age = android.os.SystemClock.elapsedRealtime() - v15CheckStartedMs;
+        return v15CheckStartedMs > 0 && age >= 0 && age <= 30000
+            ? v15CheckClick : "unlinked";
     }
 
     /** V9: targeted, read-only tracing of the known opportunity callback and error/display path. */
@@ -454,6 +601,20 @@ public final class HookEntry implements IXposedHookLoadPackage {
                                     + " static_prefix=" + routeInfo.staticPrefix
                                     + " method=" + (meta == null ? "unknown" : meta.method)
                                     + " http=" + http + " ret=" + v12ErrorCode(error), 1200);
+                            // V15: only compare the same converter response with the exact
+                            // static config/chat_can_start route. Never export an unknown path.
+                            String routeClass = "unresolved";
+                            if ("config.chat_can_start".equals(safeRoute))
+                                routeClass = "chat_can_start";
+                            else if ("config".equals(routeInfo.family))
+                                routeClass = "other_config_or_masked";
+                            else if (meta != null)
+                                routeClass = "non_config_or_masked";
+                            reportOnce("v15_quota_" + clickContext(),
+                                "paperplane.v15.quota_check click=" + clickContext()
+                                    + " route_class=" + routeClass
+                                    + " trace=" + (meta == null ? 0 : meta.trace)
+                                    + " ret=" + v12ErrorCode(error), 1200);
                         }
                     }
                 });
@@ -673,6 +834,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
             "/config/abtest",
             "/config/attitude_like",
             "/config/block_notification",
+            "/config/chat_can_start",
             "/config/district",
             "/config/flutter",
             "/config/get",
