@@ -1,1 +1,12 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"><application android:label="最右防撤回-调试版" android:allowBackup="false"><meta-data android:name="xposedmodule" android:value="true"/><meta-data android:name="xposeddescription" android:value="最右 7.3.19.2 私聊撤回事件定位；仅记录日志，不修改消息"/><meta-data android:name="xposedminversion" android:value="82"/></application></manifest>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <queries><package android:name="com.example.zuiyouantirecall" /></queries>
+    <application android:label="最右防撤回-调试版" android:allowBackup="false">
+        <activity android:name=".MainActivity" android:exported="true">
+            <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
+        </activity>
+        <provider android:name=".DiagnosticLogProvider" android:authorities="com.example.zuiyouantirecall.log" android:exported="true" />
+        <meta-data android:name="xposedmodule" android:value="true"/>
+        <meta-data android:name="xposeddescription" android:value="最右 7.3.19.2 私聊撤回定位，支持独立 TXT 日志导出"/>
+        <meta-data android:name="xposedminversion" android:value="82"/>
+    </application>
+</manifest>
