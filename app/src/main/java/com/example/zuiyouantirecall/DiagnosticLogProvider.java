@@ -4,6 +4,7 @@ import android.content.ContentProvider;
 import android.content.ContentValues;
 import android.content.UriMatcher;
 import android.database.Cursor;
+import android.database.MatrixCursor;
 import android.net.Uri;
 import android.os.Binder;
 import android.content.pm.PackageManager;
@@ -18,6 +19,8 @@ import java.util.Locale;
 public final class DiagnosticLogProvider extends ContentProvider {
     static final String AUTHORITY = "com.example.zuiyouantirecall.log";
     static final Uri URI = Uri.parse("content://" + AUTHORITY + "/event");
+    static final Uri SETTING_URI = Uri.parse("content://" + AUTHORITY + "/setting");
+    static final String PREFS = "settings";
     static final String TARGET = "cn.xiaochuankeji.tieba";
     static final String FILE = "ZuiyouAntiRecall_log.txt";
     private static final Object LOCK = new Object();
@@ -49,7 +52,12 @@ public final class DiagnosticLogProvider extends ContentProvider {
         for (String pkg : packages) if (TARGET.equals(pkg) || getContext().getPackageName().equals(pkg)) return true;
         return false;
     }
-    @Override public Cursor query(Uri u, String[] p, String s, String[] a, String o) { return null; }
+    @Override public Cursor query(Uri u, String[] p, String s, String[] a, String o) {
+        if (!SETTING_URI.equals(u) || getContext() == null || !isAllowedCaller()) return null;
+        MatrixCursor result = new MatrixCursor(new String[] {"enabled"});
+        result.addRow(new Object[] {getContext().getSharedPreferences(PREFS, 0).getBoolean("enabled", false) ? 1 : 0});
+        return result;
+    }
     @Override public String getType(Uri u) { return null; }
     @Override public int delete(Uri u, String s, String[] a) { return 0; }
     @Override public int update(Uri u, ContentValues v, String s, String[] a) { return 0; }
