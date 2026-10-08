@@ -44,16 +44,36 @@ public final class HookEntry implements IXposedHookLoadPackage {
         final String endpoint;
         final int http;
         final String safeRoute;
-        V12ResponseMeta(String endpoint, int http, String safeRoute) {
+        final V14RouteInfo routeInfo;
+        final String method;
+        final int trace;
+        V12ResponseMeta(String endpoint, int http, String safeRoute,
+                        V14RouteInfo routeInfo, String method, int trace) {
             this.endpoint = endpoint;
             this.http = http;
             this.safeRoute = safeRoute;
+            this.routeInfo = routeInfo;
+            this.method = method;
+            this.trace = trace;
         }
     }
     private static final ThreadLocal<java.util.ArrayDeque<V12ResponseMeta>> v12ResponseStack =
         new ThreadLocal<java.util.ArrayDeque<V12ResponseMeta>>();
     private static final Map<Throwable, V12ResponseMeta> v12ErrorRequests =
         java.util.Collections.synchronizedMap(new java.util.WeakHashMap<Throwable, V12ResponseMeta>());
+    private static final AtomicInteger v14ResponseSequence = new AtomicInteger();
+    private static volatile long v14RecentMatchResponseMs = 0;
+    private static volatile String v14RecentMatchClick = "unlinked";
+    private static final class V14RouteInfo {
+        final String reason;
+        final String family;
+        final String staticPrefix;
+        V14RouteInfo(String reason, String family, String staticPrefix) {
+            this.reason = reason;
+            this.family = family;
+            this.staticPrefix = staticPrefix;
+        }
+    }
     private static synchronized void reportOnce(String key, String msg, long intervalMs) {
         long now = android.os.SystemClock.elapsedRealtime();
         Long last = lastEvents.get(key);
@@ -83,7 +103,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
             XposedHelpers.findAndHookMethod(Application.class, "attach", Context.class, new XC_MethodHook() {
                 @Override protected void afterHookedMethod(MethodHookParam p) {
                     appContext = (Context) p.args[0];
-                    report("app.attach process=main module=v13");
+                    report("app.attach process=main module=v14");
                 }
             });
             Class<?> activity = Class.forName("cn.xiaochuankeji.tieba.ui.chat.ChatActivity", false, lpparam.classLoader);
@@ -303,6 +323,9 @@ public final class HookEntry implements IXposedHookLoadPackage {
                             String errorType = (p.args.length > 0 && p.args[0] instanceof Throwable)
                                 ? p.args[0].getClass().getSimpleName() : "unknown";
                             report("paperplane.v8.match_callback.failure type=" + errorType.replaceAll("[^A-Za-z0-9_]", "_"));
+                            reportOnce("v14_match_failure_" + clickContext(),
+                                "paperplane.v14.match_callback stage=failure click=" + clickContext()
+                                    + " error_type=" + errorType.replaceAll("[^A-Za-z0-9_]", "_"), 1500);
                         }
                     });
                     callbacks++;
@@ -310,7 +333,11 @@ public final class HookEntry implements IXposedHookLoadPackage {
                     method.getParameterTypes()[0].getName().endsWith("PaperPlaneMatchHttpResult")) {
                     XposedBridge.hookMethod(method, new XC_MethodHook() {
                         @Override protected void beforeHookedMethod(MethodHookParam p) {
-                            if (setting("paper_enabled")) report("paperplane.v8.match_callback.success_path");
+                            if (setting("paper_enabled")) {
+                                report("paperplane.v8.match_callback.success_path");
+                                reportOnce("v14_match_success_" + clickContext(),
+                                    "paperplane.v14.match_callback stage=success_handler click=" + clickContext(), 1500);
+                            }
                         }
                     });
                     callbacks++;
@@ -322,6 +349,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
         }
         report("paperplane.v8.precise_setup.end");
         setupV9DecisionTrace(loader);
+        setupV14MatchUiObservation();
     }
 
     /** V9: targeted, read-only tracing of the known opportunity callback and error/display path. */
@@ -413,6 +441,19 @@ public final class HookEntry implements IXposedHookLoadPackage {
                                 "paperplane.v13.quota_route click=" + clickContext()
                                     + " route=" + safeRoute + " endpoint=" + endpoint
                                     + " http=" + http + " ret=" + v12ErrorCode(error), 1200);
+                            // V14: context is the same hbf.c converter frame in which
+                            // ClientErrorException was constructed, not a time-based guess.
+                            V14RouteInfo routeInfo = meta == null ?
+                                new V14RouteInfo("unresolved", "masked", "masked") : meta.routeInfo;
+                            reportOnce("v14_route_" + clickContext(),
+                                "paperplane.v14.quota_origin click=" + clickContext()
+                                    + " assoc=" + (meta != null && meta.trace > 0 ? "converter_context" : "unresolved")
+                                    + " trace=" + (meta == null ? 0 : meta.trace)
+                                    + " reason=" + routeInfo.reason
+                                    + " family=" + routeInfo.family
+                                    + " static_prefix=" + routeInfo.staticPrefix
+                                    + " method=" + (meta == null ? "unknown" : meta.method)
+                                    + " http=" + http + " ret=" + v12ErrorCode(error), 1200);
                         }
                     }
                 });
@@ -459,7 +500,8 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 XposedBridge.hookMethod(m, new XC_MethodHook() {
                     @Override protected void beforeHookedMethod(MethodHookParam p) {
                         // Push even if inspection fails, so nesting is always balanced.
-                        V12ResponseMeta meta = new V12ResponseMeta("unresolved", -1, "unresolved");
+                        V12ResponseMeta meta = new V12ResponseMeta("unresolved", -1, "unresolved",
+                            new V14RouteInfo("unresolved", "masked", "masked"), "unknown", 0);
                         if (setting("paper_enabled") && p.args.length > 0 && p.args[0] != null) {
                             try {
                                 Object response = p.args[0];
@@ -467,7 +509,15 @@ public final class HookEntry implements IXposedHookLoadPackage {
                                 String endpoint = v12Endpoint(request);
                                 int http = ((Number) XposedHelpers.callMethod(response, "code")).intValue();
                                 String safeRoute = v13SafeRoute(request);
-                                meta = new V12ResponseMeta(endpoint, http, safeRoute);
+                                V14RouteInfo routeInfo = v14InspectRoute(request);
+                                String methodName = "unknown";
+                                try {
+                                    Object rawMethod = XposedHelpers.callMethod(request, "method");
+                                    String m = String.valueOf(rawMethod);
+                                    if ("GET".equals(m) || "POST".equals(m)) methodName = m.toLowerCase(Locale.ROOT);
+                                } catch (Throwable ignored) { }
+                                meta = new V12ResponseMeta(endpoint, http, safeRoute,
+                                    routeInfo, methodName, v14ResponseSequence.incrementAndGet());
                             } catch (Throwable ignored) { }
                         }
                         java.util.ArrayDeque<V12ResponseMeta> stack = v12ResponseStack.get();
@@ -966,6 +1016,86 @@ public final class HookEntry implements IXposedHookLoadPackage {
         }
     }
 
+
+/** V14: classify masked paths without ever exporting unknown/dynamic path text.
+ * Exact routes and prefixes can only come from V13's APK-derived constants. */
+private static V14RouteInfo v14InspectRoute(Object request) {
+    if (request == null) return new V14RouteInfo("unresolved", "masked", "masked");
+    try {
+        Object url = XposedHelpers.callMethod(request, "url");
+        String raw = String.valueOf(XposedHelpers.callMethod(url, "encodedPath"));
+        if (raw.length() < 4 || raw.length() > 160)
+            return new V14RouteInfo("invalid_length", "masked", "masked");
+        String path = raw.toLowerCase(Locale.ROOT);
+        // Percent escapes and other characters can encode identifying data.
+        if (!path.matches("/[a-z0-9_/-]{3,159}"))
+            return new V14RouteInfo("invalid_format", "masked", "masked");
+        String stripped = path.replaceFirst("^/(?:api/)?v[0-9]{1,2}(?=/)", "");
+        if (V13_STATIC_ROUTES.contains(path))
+            return new V14RouteInfo("exact_static", v14KnownFamily(path), v14SafeLabel(path));
+        if (V13_STATIC_ROUTES.contains(stripped))
+            return new V14RouteInfo("versioned_static", v14KnownFamily(stripped), v14SafeLabel(stripped));
+        // Report only a known static prefix; never the unrecognized suffix.
+        String matchedPrefix = null;
+        for (String fixed : V13_STATIC_ROUTES) {
+            if (stripped.startsWith(fixed + "/") &&
+                (matchedPrefix == null || fixed.length() > matchedPrefix.length()))
+                matchedPrefix = fixed;
+        }
+        if (matchedPrefix != null)
+            return new V14RouteInfo("dynamic_suffix", v14KnownFamily(matchedPrefix),
+                v14SafeLabel(matchedPrefix));
+        String family = v14KnownFamily(stripped);
+        // Unknown numeric segments are classified but NEVER exposed.
+        String[] segments = stripped.split("/");
+        for (int i = 1; i < segments.length; i++) {
+            String part = segments[i];
+            if (part.matches("[0-9]{2,}") || part.matches("[0-9a-f]{16,}") ||
+                (part.matches("[0-9a-f-]{32,}") && part.contains("-")))
+                return new V14RouteInfo("dynamic_segment", family, "masked");
+        }
+        return new V14RouteInfo("whitelist_miss", family, "masked");
+    } catch (Throwable ignored) {
+        return new V14RouteInfo("unresolved", "masked", "masked");
+    }
+}
+
+/** Emits a root only if it already exists as the root of an APK static API route. */
+private static String v14KnownFamily(String path) {
+    String[] segments = path.split("/");
+    if (segments.length < 2 || !segments[1].matches("[a-z_]{2,24}")) return "masked";
+    String prefix = "/" + segments[1] + "/";
+    for (String fixed : V13_STATIC_ROUTES) {
+        if (fixed.startsWith(prefix)) return segments[1];
+    }
+    return "masked";
+}
+
+private static String v14SafeLabel(String path) {
+    return path.substring(1).replace('/', '.').replace('-', '_');
+}
+
+/** Seeing ChatActivity resume is UI evidence only; it does not prove a chat was established. */
+private static void setupV14MatchUiObservation() {
+    try {
+        XposedBridge.hookAllMethods(Activity.class, "onResume", new XC_MethodHook() {
+            @Override protected void afterHookedMethod(MethodHookParam p) {
+                if (!setting("paper_enabled") || !(p.thisObject instanceof Activity)) return;
+                String cls = p.thisObject.getClass().getName();
+                if (!"cn.xiaochuankeji.tieba.ui.chat.ChatActivity".equals(cls)) return;
+                long age = android.os.SystemClock.elapsedRealtime() - v14RecentMatchResponseMs;
+                if (v14RecentMatchResponseMs > 0 && age >= 0 && age <= 20000)
+                    reportOnce("v14_chat_ui_" + v14RecentMatchClick,
+                        "paperplane.v14.chat_ui stage=activity_resumed click=" + v14RecentMatchClick,
+                        20000);
+            }
+        });
+        report("paperplane.v14.chat_ui_hook.ready");
+    } catch (Throwable t) {
+        report("paperplane.v14.chat_ui_hook.failed type=" + safeType(t));
+    }
+}
+
     /** Read-only error code accessor confirmed in APK; never read errMessage or errData. */
     private static String v12ErrorCode(Throwable error) {
         if (error == null ||
@@ -1140,6 +1270,16 @@ public final class HookEntry implements IXposedHookLoadPackage {
             if (ret != null)
                 report("paperplane.v12.response kind=" + kind + " http=" + status
                     + " ret=" + ret + " click=" + linkedClick);
+            if ("match".equals(kind)) {
+                // Three independent stages: HTTP, business ret, callback and optional chat UI.
+                reportOnce("v14_match_http_" + identity,
+                    "paperplane.v14.match_response click=" + linkedClick
+                        + " http=" + status + " ret=" + (ret == null ? "unavailable" : ret), 1500);
+                if ("1".equals(ret) && !"unlinked".equals(linkedClick)) {
+                    v14RecentMatchResponseMs = android.os.SystemClock.elapsedRealtime();
+                    v14RecentMatchClick = linkedClick;
+                }
+            }
             String business = findBusinessStatus(obj);
             if (business != null)
                 report("paperplane.v7.business kind=" + kind + " code=" + business + " click=" + linkedClick);
