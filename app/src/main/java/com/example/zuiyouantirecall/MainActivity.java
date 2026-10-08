@@ -22,7 +22,7 @@ public final class MainActivity extends Activity {
         layout.setOrientation(LinearLayout.VERTICAL);
         layout.setPadding(48, 64, 48, 32);
         TextView title = new TextView(this);
-        title.setText("最右工具 · V5 响应诊断版");
+        title.setText("最右工具 · V6 匹配校验诊断版");
         title.setTextSize(22);
         layout.addView(title);
         status = new TextView(this);
@@ -57,7 +57,7 @@ public final class MainActivity extends Activity {
         });
         TextView info = new TextView(this);
         info.setPadding(0, 32, 0, 0);
-        info.setText("防撤回 V2 实验功能保持不变。\n\n纸飞机诊断：开启开关、重启最右，然后进入纸飞机详情点击“去聊天”，再导出 TXT。新增 HTTP 响应状态、有限额度字段识别和日志去重。无法识别加密或特殊格式的返回内容；不会记录原始响应。\n\n不会修改匹配次数或绕过限制。日志不记录聊天正文、完整网址和用户标识。");
+        info.setText("防撤回 V2 实验功能保持不变。\n\n纸飞机诊断：开启开关、重启最右，然后进入纸飞机详情点击“去聊天”，再导出 TXT。新增点击编号、业务状态码诊断、额度字段识别和响应去重。无法识别加密或特殊格式的返回内容；不会记录原始响应。\n\n不会修改匹配次数或绕过限制。日志不记录聊天正文、完整网址和用户标识；也不绕过次数限制。");
         layout.addView(info);
         setContentView(layout);
     }
