@@ -38,6 +38,20 @@ public final class HookEntry implements IXposedHookLoadPackage {
     private static final Map<Object, String> callLinks = java.util.Collections.synchronizedMap(new java.util.WeakHashMap<Object, String>());
     // Weak keys ensure errors are not kept alive by the diagnostic module.
     private static final Map<Throwable, String> errorOrigins = java.util.Collections.synchronizedMap(new java.util.WeakHashMap<Throwable, String>());
+    // V12: associate errors with the exact Retrofit response being converted on the same thread.
+    // Store only an allow-listed endpoint token and numeric HTTP code, never a URL or body.
+    private static final class V12ResponseMeta {
+        final String endpoint;
+        final int http;
+        V12ResponseMeta(String endpoint, int http) {
+            this.endpoint = endpoint;
+            this.http = http;
+        }
+    }
+    private static final ThreadLocal<java.util.ArrayDeque<V12ResponseMeta>> v12ResponseStack =
+        new ThreadLocal<java.util.ArrayDeque<V12ResponseMeta>>();
+    private static final Map<Throwable, V12ResponseMeta> v12ErrorRequests =
+        java.util.Collections.synchronizedMap(new java.util.WeakHashMap<Throwable, V12ResponseMeta>());
     private static synchronized void reportOnce(String key, String msg, long intervalMs) {
         long now = android.os.SystemClock.elapsedRealtime();
         Long last = lastEvents.get(key);
@@ -67,7 +81,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
             XposedHelpers.findAndHookMethod(Application.class, "attach", Context.class, new XC_MethodHook() {
                 @Override protected void afterHookedMethod(MethodHookParam p) {
                     appContext = (Context) p.args[0];
-                    report("app.attach process=main module=v11");
+                    report("app.attach process=main module=v12");
                 }
             });
             Class<?> activity = Class.forName("cn.xiaochuankeji.tieba.ui.chat.ChatActivity", false, lpparam.classLoader);
@@ -311,6 +325,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
     /** V9: targeted, read-only tracing of the known opportunity callback and error/display path. */
     private static void setupV9DecisionTrace(ClassLoader loader) {
         report("paperplane.v9.setup.begin");
+        setupV12ResponseContext(loader);
         setupV10ExceptionConstructionTrace(loader);
         try {
             Class<?> cb = Class.forName(
@@ -380,6 +395,15 @@ public final class HookEntry implements IXposedHookLoadPackage {
                                 "paperplane.v10.error_path click=" + clickContext()
                                     + " exception=" + kind + " cause=" + origin
                                     + " throw_site=" + source + " handler_path=" + dispatch, 1200);
+                            // The exception itself supplies the business code. The endpoint comes
+                            // only from the HTTP response active while this exception was created.
+                            V12ResponseMeta meta = v12ErrorRequests.get(error);
+                            String endpoint = meta == null ? "unresolved" : meta.endpoint;
+                            String http = meta == null ? "unavailable" : String.valueOf(meta.http);
+                            reportOnce("v12_business_" + clickContext(),
+                                "paperplane.v12.business_error click=" + clickContext()
+                                    + " endpoint=" + endpoint + " http=" + http
+                                    + " ret=" + v12ErrorCode(error) + " source=exception", 1200);
                         }
                     }
                 });
@@ -413,6 +437,97 @@ public final class HookEntry implements IXposedHookLoadPackage {
         report("paperplane.v9.setup.end");
     }
 
+    /** V12: hbf.c(okhttp3.Response) is the response parser observed in the V11 stack.
+     *  The temporary thread stack prevents an unrelated later request from being
+     *  attributed to a quota error. This hook never changes arguments or results. */
+    private static void setupV12ResponseContext(ClassLoader loader) {
+        try {
+            Class<?> adapter = Class.forName("hbf", false, loader);
+            int count = 0;
+            for (Method m : adapter.getDeclaredMethods()) {
+                if (!"c".equals(m.getName()) || m.getParameterTypes().length != 1 ||
+                    !"okhttp3.Response".equals(m.getParameterTypes()[0].getName())) continue;
+                XposedBridge.hookMethod(m, new XC_MethodHook() {
+                    @Override protected void beforeHookedMethod(MethodHookParam p) {
+                        // Push even if inspection fails, so nesting is always balanced.
+                        V12ResponseMeta meta = new V12ResponseMeta("unresolved", -1);
+                        if (setting("paper_enabled") && p.args.length > 0 && p.args[0] != null) {
+                            try {
+                                Object response = p.args[0];
+                                Object request = XposedHelpers.callMethod(response, "request");
+                                String endpoint = v12Endpoint(request);
+                                int http = ((Number) XposedHelpers.callMethod(response, "code")).intValue();
+                                meta = new V12ResponseMeta(endpoint, http);
+                            } catch (Throwable ignored) { }
+                        }
+                        java.util.ArrayDeque<V12ResponseMeta> stack = v12ResponseStack.get();
+                        if (stack == null) {
+                            stack = new java.util.ArrayDeque<V12ResponseMeta>();
+                            v12ResponseStack.set(stack);
+                        }
+                        stack.push(meta);
+                    }
+                    @Override protected void afterHookedMethod(MethodHookParam p) {
+                        java.util.ArrayDeque<V12ResponseMeta> stack = v12ResponseStack.get();
+                        if (stack != null) {
+                            if (!stack.isEmpty()) stack.pop();
+                            if (stack.isEmpty()) v12ResponseStack.remove();
+                        }
+                    }
+                });
+                count++;
+            }
+            report("paperplane.v12.response_hooks=" + count);
+        } catch (Throwable t) {
+            report("paperplane.v12.response_hooks.failed type=" + safeType(t));
+        }
+    }
+
+    /** A coarse endpoint token only: never include host, query, ID, or raw URL. */
+    private static String v12Endpoint(Object request) {
+        if (request == null) return "unresolved";
+        try {
+            Object url = XposedHelpers.callMethod(request, "url");
+            String path = String.valueOf(XposedHelpers.callMethod(url, "encodedPath"))
+                .toLowerCase(Locale.ROOT);
+            String section = "/paperplane/";
+            int i = path.indexOf(section);
+            if (i < 0) {
+                section = "/paper_plane/";
+                i = path.indexOf(section);
+            }
+            if (i < 0) return "non_paperplane";
+            String segment = path.substring(i + section.length());
+            // Reject trailing segments and any dynamic identifiers.
+            if (!segment.matches("[a-z_]{2,48}")) return "paperplane_other";
+            return "paperplane_" + segment;
+        } catch (Throwable ignored) {
+            return "unresolved";
+        }
+    }
+
+    /** Read-only error code accessor confirmed in APK; never read errMessage or errData. */
+    private static String v12ErrorCode(Throwable error) {
+        if (error == null ||
+            !"com.izuiyou.network.ClientErrorException".equals(error.getClass().getName()))
+            return "unavailable";
+        try {
+            Object result = XposedHelpers.callMethod(error, "errCode");
+            return result instanceof Number ? String.valueOf(((Number) result).intValue()) : "unavailable";
+        } catch (Throwable ignored) {
+            return "unavailable";
+        }
+    }
+
+    /** Only a top-level numeric ret: no messages, nested data, or response payloads. */
+    private static String v12TopLevelRet(JSONObject obj) {
+        Object value = obj.opt("ret");
+        if (value instanceof Number) return String.valueOf(((Number) value).intValue());
+        if (value instanceof String && ((String) value).matches("-?[0-9]{1,10}"))
+            return (String) value;
+        return null;
+    }
+
     /** V10: constructor trace is observational; it never changes exception or response behavior. */
     private static void setupV10ExceptionConstructionTrace(ClassLoader loader) {
         try {
@@ -428,6 +543,9 @@ public final class HookEntry implements IXposedHookLoadPackage {
                         if ("unresolved".equals(origin))
                             origin = limitedTrace(Thread.currentThread().getStackTrace(), 5);
                         errorOrigins.put(error, origin);
+                        java.util.ArrayDeque<V12ResponseMeta> stack = v12ResponseStack.get();
+                        if (stack != null && !stack.isEmpty())
+                            v12ErrorRequests.put(error, stack.peek());
                         // Logging is limited to the user's current paper-plane click and quota failures.
                         if (!"none".equals(clickContext()) && isQuotaPrompt(error.getMessage())) {
                             reportOnce("v10_construct_" + clickContext(),
@@ -558,6 +676,10 @@ public final class HookEntry implements IXposedHookLoadPackage {
             Object peek = XposedHelpers.callMethod(response, "peekBody", 4096L);
             String body = String.valueOf(XposedHelpers.callMethod(peek, "string"));
             JSONObject obj = new JSONObject(body);
+            String ret = v12TopLevelRet(obj);
+            if (ret != null)
+                report("paperplane.v12.response kind=" + kind + " http=" + status
+                    + " ret=" + ret + " click=" + linkedClick);
             String business = findBusinessStatus(obj);
             if (business != null)
                 report("paperplane.v7.business kind=" + kind + " code=" + business + " click=" + linkedClick);
@@ -600,14 +722,14 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
     private static String findBusinessStatus(JSONObject data) {
         // Numeric status codes only. Never record message/error descriptions.
-        for (String k : new String[]{"code", "status", "error_code", "errcode", "errno"}) {
+        for (String k : new String[]{"ret", "code", "status", "error_code", "errcode", "errno"}) {
             Object v = data.opt(k);
             if (v instanceof Number) return k + ":" + ((Number)v).longValue();
             if (v instanceof String && ((String)v).matches("-?[0-9]{1,9}")) return k + ":" + v;
         }
         JSONObject nested = data.optJSONObject("data");
         if (nested != null) {
-            for (String k : new String[]{"code", "status", "error_code", "errcode", "errno"}) {
+            for (String k : new String[]{"ret", "code", "status", "error_code", "errcode", "errno"}) {
                 Object v = nested.opt(k);
                 if (v instanceof Number) return "data." + k + ":" + ((Number)v).longValue();
             }
