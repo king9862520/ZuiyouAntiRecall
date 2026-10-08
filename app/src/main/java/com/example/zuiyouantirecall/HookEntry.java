@@ -198,7 +198,108 @@ public final class HookEntry implements IXposedHookLoadPackage {
             report("paperplane.v7.text_hook.ready");
         } catch (Throwable t) { report("paperplane.v7.text_hook.unavailable"); }
         report("paperplane.v7.setup.end");
+        setupQuotaTraceHooks(loader);
     }
+
+    /** Read-only tracing at the application API and result handlers found in 7.3.19.2. */
+    private static void setupQuotaTraceHooks(ClassLoader loader) {
+        report("paperplane.v8.precise_setup.begin");
+        try {
+            Class<?> api = Class.forName("cn.xiaochuankeji.tieba.api.paperplane.PaperPlaneApi", false, loader);
+            int hooked = 0;
+            for (Method method : api.getDeclaredMethods()) {
+                final String name = method.getName();
+                final int parameters = method.getParameterTypes().length;
+                if (!("c".equals(name) && parameters == 0) && !("g".equals(name) && parameters == 2)) continue;
+                XposedBridge.hookMethod(method, new XC_MethodHook() {
+                    @Override protected void beforeHookedMethod(MethodHookParam p) {
+                        if (!setting("paper_enabled")) return;
+                        if ("c".equals(name)) reportOnce("precise_count", "paperplane.v8.api.count_called", 500);
+                        else reportOnce("precise_match", "paperplane.v8.api.match_called", 500);
+                    }
+                });
+                hooked++;
+            }
+            report("paperplane.v8.api_hooks=" + hooked);
+        } catch (Throwable t) {
+            report("paperplane.v8.api_hooks.failed type=" + t.getClass().getSimpleName());
+        }
+        int countCallbacks = 0;
+        for (String suffix : new String[] {"$l", "$a"}) {
+            try {
+                final String handler = "$l".equals(suffix) ? "refresh" : "opportunity";
+                Class<?> callback = Class.forName(
+                    "cn.xiaochuankeji.tieba.ui.home.page.second_page.friends.FriendsPaperPlaneHomePageActivity" + suffix,
+                    false, loader);
+                for (Method method : callback.getDeclaredMethods()) {
+                    if (!"a".equals(method.getName()) || method.getParameterTypes().length != 1 ||
+                        !"rq3".equals(method.getParameterTypes()[0].getName())) continue;
+                    XposedBridge.hookMethod(method, new XC_MethodHook() {
+                        @Override protected void beforeHookedMethod(MethodHookParam p) {
+                            if (!setting("paper_enabled") || p.args.length != 1 || p.args[0] == null) return;
+                            try {
+                                Object result = XposedHelpers.callMethod(p.args[0], "a");
+                                if (!(result instanceof Number)) return;
+                                long value = ((Number) result).longValue();
+                                if (value < -1000000 || value > 1000000) return;
+                                report("paperplane.v8.count_callback stage=" + handler + " value=" + value);
+                            } catch (Throwable t) {
+                                reportOnce("precise_callback_fail", "paperplane.v8.count_callback.read_failed", 15000);
+                            }
+                        }
+                    });
+                    countCallbacks++;
+                }
+            } catch (Throwable t) {
+                report("paperplane.v8.count_callback.unavailable handler=" + ("$l".equals(suffix) ? "refresh" : "opportunity"));
+            }
+        }
+        report("paperplane.v8.count_callbacks=" + countCallbacks);
+        try {
+            Class<?> activity = Class.forName(
+                "cn.xiaochuankeji.tieba.ui.home.page.second_page.friends.FriendsPaperPlaneHomePageActivity", false, loader);
+            XposedBridge.hookAllMethods(activity, "R3", new XC_MethodHook() {
+                @Override protected void beforeHookedMethod(MethodHookParam p) {
+                    if (setting("paper_enabled")) reportOnce("home_match", "paperplane.v8.home_match_attempt", 500);
+                }
+            });
+            report("paperplane.v8.home_match_hook.ready");
+        } catch (Throwable t) {
+            report("paperplane.v8.home_match_hook.unavailable");
+        }
+        try {
+            Class<?> callback = Class.forName(
+                "cn.xiaochuankeji.tieba.ui.home.page.second_page.friends.FriendsPaperPlaneHomePageActivity$d", false, loader);
+            int callbacks = 0;
+            for (Method method : callback.getDeclaredMethods()) {
+                String name = method.getName();
+                if ("onFail".equals(name) && method.getParameterTypes().length == 1) {
+                    XposedBridge.hookMethod(method, new XC_MethodHook() {
+                        @Override protected void beforeHookedMethod(MethodHookParam p) {
+                            if (!setting("paper_enabled")) return;
+                            String errorType = (p.args.length > 0 && p.args[0] instanceof Throwable)
+                                ? p.args[0].getClass().getSimpleName() : "unknown";
+                            report("paperplane.v8.match_callback.failure type=" + errorType.replaceAll("[^A-Za-z0-9_]", "_"));
+                        }
+                    });
+                    callbacks++;
+                } else if ("a".equals(name) && method.getParameterTypes().length == 1 &&
+                    method.getParameterTypes()[0].getName().endsWith("PaperPlaneMatchHttpResult")) {
+                    XposedBridge.hookMethod(method, new XC_MethodHook() {
+                        @Override protected void beforeHookedMethod(MethodHookParam p) {
+                            if (setting("paper_enabled")) report("paperplane.v8.match_callback.success_path");
+                        }
+                    });
+                    callbacks++;
+                }
+            }
+            report("paperplane.v8.match_callbacks=" + callbacks);
+        } catch (Throwable t) {
+            report("paperplane.v8.match_callbacks.unavailable");
+        }
+        report("paperplane.v8.precise_setup.end");
+    }
+
     private static void observeRequest(Object req, String origin) {
         if (req == null) return;
         try {
