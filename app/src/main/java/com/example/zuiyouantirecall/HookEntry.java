@@ -36,6 +36,8 @@ public final class HookEntry implements IXposedHookLoadPackage {
     // Weak keys avoid retaining third-party requests or calls beyond their lifetime.
     private static final Map<Object, String> requestLinks = java.util.Collections.synchronizedMap(new java.util.WeakHashMap<Object, String>());
     private static final Map<Object, String> callLinks = java.util.Collections.synchronizedMap(new java.util.WeakHashMap<Object, String>());
+    // Weak keys ensure errors are not kept alive by the diagnostic module.
+    private static final Map<Throwable, String> errorOrigins = java.util.Collections.synchronizedMap(new java.util.WeakHashMap<Throwable, String>());
     private static synchronized void reportOnce(String key, String msg, long intervalMs) {
         long now = android.os.SystemClock.elapsedRealtime();
         Long last = lastEvents.get(key);
@@ -309,6 +311,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
     /** V9: targeted, read-only tracing of the known opportunity callback and error/display path. */
     private static void setupV9DecisionTrace(ClassLoader loader) {
         report("paperplane.v9.setup.begin");
+        setupV10ExceptionConstructionTrace(loader);
         try {
             Class<?> cb = Class.forName(
                 "cn.xiaochuankeji.tieba.ui.home.page.second_page.friends.FriendsPaperPlaneHomePageActivity$a",
@@ -365,6 +368,19 @@ public final class HookEntry implements IXposedHookLoadPackage {
                         reportOnce("v9_error_" + clickContext() + "_" + kind,
                             "paperplane.v9.error_dispatch source=un6.c click=" + clickContext()
                                 + " type=" + kind + " quota_text=" + quotaText, 1500);
+                        // Only classify the quota-related exception; no error message, user data, or request body.
+                        if (quotaText) {
+                            String source = errorOrigins.get(error);
+                            if (source == null || "unresolved".equals(source))
+                                source = limitedTrace(error.getStackTrace(), 5);
+                            Throwable cause = error.getCause();
+                            String origin = safeType(cause);
+                            String dispatch = limitedTrace(Thread.currentThread().getStackTrace(), 5);
+                            reportOnce("v10_dispatch_" + clickContext(),
+                                "paperplane.v10.error_path click=" + clickContext()
+                                    + " exception=" + kind + " cause=" + origin
+                                    + " throw_site=" + source + " handler_path=" + dispatch, 1200);
+                        }
                     }
                 });
                 hooks++;
@@ -395,6 +411,57 @@ public final class HookEntry implements IXposedHookLoadPackage {
             report("paperplane.v9.tip_hooks.failed type=" + safeType(t));
         }
         report("paperplane.v9.setup.end");
+    }
+
+    /** V10: constructor trace is observational; it never changes exception or response behavior. */
+    private static void setupV10ExceptionConstructionTrace(ClassLoader loader) {
+        try {
+            Class<?> errorClass = Class.forName("com.izuiyou.network.ClientErrorException", false, loader);
+            java.util.Set<de.robv.android.xposed.XC_MethodHook.Unhook> hooks =
+                XposedBridge.hookAllConstructors(errorClass, new XC_MethodHook() {
+                    @Override protected void afterHookedMethod(MethodHookParam p) {
+                        if (!setting("paper_enabled") || !(p.thisObject instanceof Throwable)) return;
+                        Throwable error = (Throwable) p.thisObject;
+                        // A constructor can call another constructor; retain the first observation.
+                        if (errorOrigins.containsKey(error)) return;
+                        String origin = limitedTrace(error.getStackTrace(), 5);
+                        if ("unresolved".equals(origin))
+                            origin = limitedTrace(Thread.currentThread().getStackTrace(), 5);
+                        errorOrigins.put(error, origin);
+                        // Logging is limited to the user's current paper-plane click and quota failures.
+                        if (!"none".equals(clickContext()) && isQuotaPrompt(error.getMessage())) {
+                            reportOnce("v10_construct_" + clickContext(),
+                                "paperplane.v10.exception_created click=" + clickContext()
+                                    + " origin=" + origin, 1200);
+                        }
+                    }
+                });
+            report("paperplane.v10.constructor_hooks=" + hooks.size());
+        } catch (Throwable t) {
+            report("paperplane.v10.constructor_hooks.failed type=" + safeType(t));
+        }
+    }
+
+    /** Limit to package/class/method names: no raw exception messages, URLs, line args, IDs or content. */
+    private static String limitedTrace(StackTraceElement[] elements, int maxFrames) {
+        StringBuilder b = new StringBuilder();
+        if (elements == null) return "unresolved";
+        int count = 0;
+        for (StackTraceElement frame : elements) {
+            String type = frame.getClassName();
+            if (type == null || type.contains("zuiyouantirecall") ||
+                type.startsWith("de.robv.android.xposed") || type.startsWith("java.lang.reflect") ||
+                type.startsWith("org.lsposed") || type.startsWith("java.lang.Thread")) continue;
+            boolean target = type.startsWith("cn.xiaochuankeji.") || type.startsWith("com.izuiyou.") ||
+                type.startsWith("okhttp3.") || type.startsWith("retrofit2.") ||
+                (!type.contains(".") && type.length() <= 24);
+            if (!target) continue;
+            if (b.length() > 0) b.append(" > ");
+            b.append(type.replaceAll("[^A-Za-z0-9_.$]", "_").substring(0, Math.min(95, type.length())))
+                .append('.').append(frame.getMethodName().replaceAll("[^A-Za-z0-9_$]", "_"));
+            if (++count >= maxFrames || b.length() > 450) break;
+        }
+        return b.length() == 0 ? "unresolved" : b.toString();
     }
 
     private static String safeType(Throwable t) {
