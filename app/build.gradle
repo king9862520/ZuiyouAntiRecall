@@ -1,0 +1,7 @@
+plugins { id 'com.android.application' }
+android {
+    namespace 'com.example.zuiyouantirecall'
+    compileSdk 35
+    defaultConfig { applicationId 'com.example.zuiyouantirecall'; minSdk 26; targetSdk 28; versionCode 1; versionName '0.1-diagnostic' }
+}
+dependencies { compileOnly 'de.robv.android.xposed:api:82' }

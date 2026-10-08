@@ -1,0 +1,1 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"><application android:label="最右防撤回-调试版" android:allowBackup="false"><meta-data android:name="xposedmodule" android:value="true"/><meta-data android:name="xposeddescription" android:value="最右 7.3.19.2 私聊撤回事件定位；仅记录日志，不修改消息"/><meta-data android:name="xposedminversion" android:value="82"/></application></manifest>
