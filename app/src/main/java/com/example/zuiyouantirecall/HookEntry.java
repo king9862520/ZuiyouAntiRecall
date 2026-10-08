@@ -181,7 +181,10 @@ public final class HookEntry implements IXposedHookLoadPackage {
                     try {
                         String message = value instanceof CharSequence ? value.toString() :
                                 value instanceof Integer ? ((Context)p.args[0]).getString((Integer)value) : "";
-                        if (isQuotaPrompt(message)) report("paperplane.v7.quota_prompt source=toast click=" + clickContext());
+                        if (isQuotaPrompt(message)) {
+                            report("paperplane.v7.quota_prompt source=toast click=" + clickContext());
+                            reportQuotaOrigin("toast");
+                        }
                     } catch (Throwable ignored) { }
                 }
             });
@@ -191,8 +194,10 @@ public final class HookEntry implements IXposedHookLoadPackage {
             XposedBridge.hookAllMethods(TextView.class, "setText", new XC_MethodHook() {
                 @Override protected void beforeHookedMethod(MethodHookParam p) {
                     if (!setting("paper_enabled") || p.args.length == 0 || !(p.args[0] instanceof CharSequence)) return;
-                    if (isQuotaPrompt(p.args[0].toString()))
+                    if (isQuotaPrompt(p.args[0].toString())) {
                         reportOnce("quota_textview_" + activeClick, "paperplane.v7.quota_prompt source=textview click=" + clickContext(), 2000);
+                        reportQuotaOrigin("textview");
+                    }
                 }
             });
             report("paperplane.v7.text_hook.ready");
@@ -298,6 +303,128 @@ public final class HookEntry implements IXposedHookLoadPackage {
             report("paperplane.v8.match_callbacks.unavailable");
         }
         report("paperplane.v8.precise_setup.end");
+        setupV9DecisionTrace(loader);
+    }
+
+    /** V9: targeted, read-only tracing of the known opportunity callback and error/display path. */
+    private static void setupV9DecisionTrace(ClassLoader loader) {
+        report("paperplane.v9.setup.begin");
+        try {
+            Class<?> cb = Class.forName(
+                "cn.xiaochuankeji.tieba.ui.home.page.second_page.friends.FriendsPaperPlaneHomePageActivity$a",
+                false, loader);
+            int hooks = 0;
+            for (Method method : cb.getDeclaredMethods()) {
+                if (!"a".equals(method.getName()) || method.getParameterTypes().length != 1
+                    || !"rq3".equals(method.getParameterTypes()[0].getName())) continue;
+                XposedBridge.hookMethod(method, new XC_MethodHook() {
+                    @Override protected void beforeHookedMethod(MethodHookParam p) {
+                        if (!setting("paper_enabled") || p.args.length == 0 || p.args[0] == null) return;
+                        String value = "unavailable";
+                        String messageKind = "unavailable";
+                        try {
+                            Object result = XposedHelpers.callMethod(p.args[0], "a");
+                            if (result instanceof Number) {
+                                long number = ((Number) result).longValue();
+                                if (number >= -1000000 && number <= 1000000) value = String.valueOf(number);
+                            }
+                        } catch (Throwable ignored) { }
+                        try {
+                            Object hint = XposedHelpers.callMethod(p.args[0], "b");
+                            if (hint instanceof String) {
+                                messageKind = isQuotaPrompt((String) hint) ? "quota" : "other";
+                            }
+                        } catch (Throwable ignored) { }
+                        // Report input classification only; no claims about server enforcement.
+                        report("paperplane.v9.opportunity_callback value=" + value
+                            + " message=" + messageKind + " click=" + clickContext());
+                    }
+                });
+                hooks++;
+            }
+            report("paperplane.v9.opportunity_hooks=" + hooks);
+        } catch (Throwable t) {
+            report("paperplane.v9.opportunity_hooks.failed type=" + safeType(t));
+        }
+        try {
+            Class<?> errorUtil = Class.forName("un6", false, loader);
+            int hooks = 0;
+            for (Method method : errorUtil.getDeclaredMethods()) {
+                Class<?>[] args = method.getParameterTypes();
+                if (!"c".equals(method.getName()) || args.length != 3
+                    || !Context.class.isAssignableFrom(args[0])
+                    || !Throwable.class.isAssignableFrom(args[1])
+                    || args[2] != Boolean.TYPE) continue;
+                XposedBridge.hookMethod(method, new XC_MethodHook() {
+                    @Override protected void beforeHookedMethod(MethodHookParam p) {
+                        if (!setting("paper_enabled") || "none".equals(clickContext())) return;
+                        Throwable error = p.args.length > 1 && p.args[1] instanceof Throwable
+                            ? (Throwable) p.args[1] : null;
+                        String kind = error == null ? "unknown" : safeType(error);
+                        boolean quotaText = error != null && isQuotaPrompt(error.getMessage());
+                        reportOnce("v9_error_" + clickContext() + "_" + kind,
+                            "paperplane.v9.error_dispatch source=un6.c click=" + clickContext()
+                                + " type=" + kind + " quota_text=" + quotaText, 1500);
+                    }
+                });
+                hooks++;
+            }
+            report("paperplane.v9.error_hooks=" + hooks);
+        } catch (Throwable t) {
+            report("paperplane.v9.error_hooks.failed type=" + safeType(t));
+        }
+        try {
+            Class<?> tip = Class.forName("oo", false, loader);
+            int hooks = 0;
+            for (Method method : tip.getDeclaredMethods()) {
+                if (!"e".equals(method.getName()) || method.getParameterTypes().length != 1
+                    || method.getParameterTypes()[0] != String.class) continue;
+                XposedBridge.hookMethod(method, new XC_MethodHook() {
+                    @Override protected void beforeHookedMethod(MethodHookParam p) {
+                        if (!setting("paper_enabled") || p.args.length == 0
+                            || !(p.args[0] instanceof String) || !isQuotaPrompt((String) p.args[0])) return;
+                        reportOnce("v9_tip_" + clickContext(),
+                            "paperplane.v9.quota_display source=oo.e click=" + clickContext(), 1500);
+                        reportQuotaOrigin("oo.e");
+                    }
+                });
+                hooks++;
+            }
+            report("paperplane.v9.tip_hooks=" + hooks);
+        } catch (Throwable t) {
+            report("paperplane.v9.tip_hooks.failed type=" + safeType(t));
+        }
+        report("paperplane.v9.setup.end");
+    }
+
+    private static String safeType(Throwable t) {
+        if (t == null) return "unknown";
+        String s = t.getClass().getSimpleName().replaceAll("[^A-Za-z0-9_]", "_");
+        return s.length() > 80 ? s.substring(0, 80) : s;
+    }
+
+    /** Only class/method names near the quota prompt: no messages, IDs, URLs or payloads. */
+    private static void reportQuotaOrigin(String displaySource) {
+        if (!setting("paper_enabled")) return;
+        String click = clickContext();
+        StringBuilder chain = new StringBuilder();
+        try {
+            for (StackTraceElement e : Thread.currentThread().getStackTrace()) {
+                String type = e.getClassName();
+                if (type.contains("zuiyouantirecall") || type.startsWith("de.robv.android.xposed")) continue;
+                if (!type.startsWith("cn.xiaochuankeji.tieba.")
+                    && !"un6".equals(type) && !"oo".equals(type)) continue;
+                if (chain.length() > 0) chain.append(" > ");
+                String simple = type.startsWith("cn.xiaochuankeji.tieba.")
+                    ? type.substring("cn.xiaochuankeji.tieba.".length()) : type;
+                chain.append(simple.replaceAll("[^A-Za-z0-9_.$]", "_") )
+                    .append('.').append(e.getMethodName().replaceAll("[^A-Za-z0-9_$]", "_"));
+                if (chain.length() > 380 || chain.toString().split(" > ").length >= 5) break;
+            }
+        } catch (Throwable ignored) { }
+        reportOnce("v9_origin_" + displaySource + "_" + click,
+            "paperplane.v9.prompt_origin source=" + displaySource + " click=" + click
+                + " chain=" + (chain.length() == 0 ? "unresolved" : chain.toString()), 1500);
     }
 
     private static void observeRequest(Object req, String origin) {
