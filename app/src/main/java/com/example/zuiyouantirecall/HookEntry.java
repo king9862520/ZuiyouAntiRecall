@@ -33,6 +33,9 @@ public final class HookEntry implements IXposedHookLoadPackage {
     private static final AtomicInteger clickSequence = new AtomicInteger();
     private static volatile int activeClick = 0;
     private static final java.util.Set<String> responseSeen = java.util.Collections.synchronizedSet(new java.util.HashSet<String>());
+    // Weak keys avoid retaining third-party requests or calls beyond their lifetime.
+    private static final Map<Object, String> requestLinks = java.util.Collections.synchronizedMap(new java.util.WeakHashMap<Object, String>());
+    private static final Map<Object, String> callLinks = java.util.Collections.synchronizedMap(new java.util.WeakHashMap<Object, String>());
     private static synchronized void reportOnce(String key, String msg, long intervalMs) {
         long now = android.os.SystemClock.elapsedRealtime();
         Long last = lastEvents.get(key);
@@ -92,7 +95,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
     /** Observe only coarse diagnostic events, never request payloads, URLs, identities or messages. */
     private static void setupPaperPlaneDiagnostics(ClassLoader loader) {
-        report("paperplane.v6.setup.begin");
+        report("paperplane.v7.setup.begin");
         try {
             // This marks the actual button click if it is implemented as a TextView/Button.
             XposedBridge.hookAllMethods(View.class, "performClick", new XC_MethodHook() {
@@ -104,12 +107,12 @@ public final class HookEntry implements IXposedHookLoadPackage {
                         lastClickMs = android.os.SystemClock.elapsedRealtime();
                         networkSeen.set(0);
                         activeClick = clickSequence.incrementAndGet();
-                        report("paperplane.v6.click id=" + activeClick);
+                        report("paperplane.v7.click id=" + activeClick);
                     }
                 }
             });
-            report("paperplane.v6.click_hook.ready");
-        } catch (Throwable t) { report("paperplane.v6.click_hook.failed"); }
+            report("paperplane.v7.click_hook.ready");
+        } catch (Throwable t) { report("paperplane.v7.click_hook.failed"); }
         try {
             Class<?> builder = Class.forName("okhttp3.Request$Builder", false, loader);
             XposedBridge.hookAllMethods(builder, "build", new XC_MethodHook() {
@@ -119,8 +122,8 @@ public final class HookEntry implements IXposedHookLoadPackage {
                     catch (Throwable ignored) { }
                 }
             });
-            report("paperplane.v6.okhttp_builder.ready");
-        } catch (Throwable t) { report("paperplane.v6.okhttp_builder.unavailable"); }
+            report("paperplane.v7.okhttp_builder.ready");
+        } catch (Throwable t) { report("paperplane.v7.okhttp_builder.unavailable"); }
         try {
             // Covers the common execution point even if requests are built elsewhere.
             Class<?> call = Class.forName("okhttp3.RealCall", false, loader);
@@ -129,13 +132,17 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 XposedBridge.hookMethod(m, new XC_MethodHook() {
                     @Override protected void beforeHookedMethod(MethodHookParam p) {
                         if (!setting("paper_enabled")) return;
-                        try { observeRequest(XposedHelpers.callMethod(p.thisObject, "request"), "call"); }
-                        catch (Throwable ignored) { report("paperplane.v6.call_observed"); }
+                        try {
+                            Object req = XposedHelpers.callMethod(p.thisObject, "request");
+                            String link = captureLink(req);
+                            callLinks.put(p.thisObject, link);
+                            observeRequest(req, "call");
+                        } catch (Throwable ignored) { reportOnce("call_failed", "paperplane.v7.call.inspect_failed", 10000); }
                     }
                 });
             }
-            report("paperplane.v6.okhttp_call.ready");
-        } catch (Throwable t) { report("paperplane.v6.okhttp_call.unavailable"); }
+            report("paperplane.v7.okhttp_call.ready");
+        } catch (Throwable t) { report("paperplane.v7.okhttp_call.unavailable"); }
         // RealCall response point is shared by synchronous and asynchronous calls in common OkHttp versions.
         // Only inspect metadata and a capped peek of quota responses; never consume the real response body.
         int responseHooks = 0;
@@ -148,24 +155,24 @@ public final class HookEntry implements IXposedHookLoadPackage {
                         @Override protected void afterHookedMethod(MethodHookParam p) {
                             if (!setting("paper_enabled")) return;
                             try { observeResponse(p.thisObject, p.getResult(), p.getThrowable()); }
-                            catch (Throwable ignored) { reportOnce("response_error", "paperplane.v6.response.inspect_failed", 10000); }
+                            catch (Throwable ignored) { reportOnce("response_error", "paperplane.v7.response.inspect_failed", 10000); }
                         }
                     });
                     responseHooks++;
                 }
             } catch (Throwable ignored) { }
         }
-        report("paperplane.v6.response_hooks=" + responseHooks);
+        report("paperplane.v7.response_hooks=" + responseHooks);
         try {
             XposedBridge.hookAllMethods(WebView.class, "loadUrl", new XC_MethodHook() {
                 @Override protected void beforeHookedMethod(MethodHookParam p) {
                     if (!setting("paper_enabled") || p.args.length == 0 || !(p.args[0] instanceof String)) return;
                     String u = ((String)p.args[0]).toLowerCase(Locale.ROOT);
-                    if (u.contains("paperplane") || u.contains("paper_plane")) report("paperplane.v6.webview_navigation");
+                    if (u.contains("paperplane") || u.contains("paper_plane")) report("paperplane.v7.webview_navigation");
                 }
             });
-            report("paperplane.v6.webview_hook.ready");
-        } catch (Throwable t) { report("paperplane.v6.webview_hook.unavailable"); }
+            report("paperplane.v7.webview_hook.ready");
+        } catch (Throwable t) { report("paperplane.v7.webview_hook.unavailable"); }
         try {
             XposedBridge.hookAllMethods(Toast.class, "makeText", new XC_MethodHook() {
                 @Override protected void beforeHookedMethod(MethodHookParam p) {
@@ -174,23 +181,23 @@ public final class HookEntry implements IXposedHookLoadPackage {
                     try {
                         String message = value instanceof CharSequence ? value.toString() :
                                 value instanceof Integer ? ((Context)p.args[0]).getString((Integer)value) : "";
-                        if (isQuotaPrompt(message)) report("paperplane.v6.quota_prompt source=toast click=" + clickContext());
+                        if (isQuotaPrompt(message)) report("paperplane.v7.quota_prompt source=toast click=" + clickContext());
                     } catch (Throwable ignored) { }
                 }
             });
-            report("paperplane.v6.toast_hook.ready");
-        } catch (Throwable t) { report("paperplane.v6.toast_hook.unavailable"); }
+            report("paperplane.v7.toast_hook.ready");
+        } catch (Throwable t) { report("paperplane.v7.toast_hook.unavailable"); }
         try {
             XposedBridge.hookAllMethods(TextView.class, "setText", new XC_MethodHook() {
                 @Override protected void beforeHookedMethod(MethodHookParam p) {
                     if (!setting("paper_enabled") || p.args.length == 0 || !(p.args[0] instanceof CharSequence)) return;
                     if (isQuotaPrompt(p.args[0].toString()))
-                        reportOnce("quota_textview_" + activeClick, "paperplane.v6.quota_prompt source=textview click=" + clickContext(), 2000);
+                        reportOnce("quota_textview_" + activeClick, "paperplane.v7.quota_prompt source=textview click=" + clickContext(), 2000);
                 }
             });
-            report("paperplane.v6.text_hook.ready");
-        } catch (Throwable t) { report("paperplane.v6.text_hook.unavailable"); }
-        report("paperplane.v6.setup.end");
+            report("paperplane.v7.text_hook.ready");
+        } catch (Throwable t) { report("paperplane.v7.text_hook.unavailable"); }
+        report("paperplane.v7.setup.end");
     }
     private static void observeRequest(Object req, String origin) {
         if (req == null) return;
@@ -203,11 +210,12 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 else if (path.contains("match_fallback")) kind = "match_fallback";
                 else if (path.endsWith("/match")) kind = "match";
                 else if (path.contains("opportunity")) kind = "opportunity";
-                reportOnce("request_" + kind, "paperplane.v6.request kind=" + kind + " click=" + clickContext(), 1500);
+                String link = captureLink(req);
+                reportOnce("request_" + kind + "_" + link, "paperplane.v7.request kind=" + kind + " click=" + link, 1500);
             } else {
                 long age = android.os.SystemClock.elapsedRealtime() - lastClickMs;
                 if (lastClickMs > 0 && age >= 0 && age < 8000 && networkSeen.getAndIncrement() < 5)
-                    reportOnce("network_click", "paperplane.v6.network_after_click id=" + activeClick, 2000);
+                    reportOnce("network_click", "paperplane.v7.network_after_click id=" + activeClick, 2000);
             }
         } catch (Throwable ignored) { }
     }
@@ -232,8 +240,12 @@ public final class HookEntry implements IXposedHookLoadPackage {
         }
         String kind = requestKind(request);
         if (kind == null) return;
+        String link = callLinks.get(call);
+        if (link == null && request != null) link = requestLinks.get(request);
+        if (link == null) link = "unlinked";
+        final String linkedClick = link;
         if (error != null || response == null) {
-            reportOnce("response_fail_" + kind, "paperplane.v6.response kind=" + kind + " result=exception click=" + clickContext(), 1000);
+            reportOnce("response_fail_" + kind, "paperplane.v7.response kind=" + kind + " result=exception click=" + linkedClick, 1000);
             return;
         }
         int status;
@@ -243,31 +255,43 @@ public final class HookEntry implements IXposedHookLoadPackage {
         String identity = Integer.toHexString(System.identityHashCode(response));
         if (!responseSeen.add(identity)) return;
         if (responseSeen.size() > 800) responseSeen.clear();
-        report("paperplane.v6.response kind=" + kind + " http=" + status + " click=" + clickContext());
+        report("paperplane.v7.response kind=" + kind + " http=" + status + " click=" + linkedClick);
         // peekBody returns a copy; this never consumes or replaces the original response.
         // Inspect only allow-listed scalar metadata; don't write raw response, body or account data.
+        if (!"match".equals(kind) && !"count".equals(kind) && !"match_fallback".equals(kind)) return;
         try {
             Object peek = XposedHelpers.callMethod(response, "peekBody", 4096L);
             String body = String.valueOf(XposedHelpers.callMethod(peek, "string"));
             JSONObject obj = new JSONObject(body);
             String business = findBusinessStatus(obj);
             if (business != null)
-                report("paperplane.v6.business kind=" + kind + " code=" + business + " click=" + clickContext());
+                report("paperplane.v7.business kind=" + kind + " code=" + business + " click=" + linkedClick);
+            else
+                reportOnce("missing_status_" + kind, "paperplane.v7.business.status_not_found kind=" + kind, 10000);
             if (!"count".equals(kind)) return;
             Integer remaining = findRemaining(obj, 0);
             if (remaining == null) {
-                reportOnce("quota_unknown", "paperplane.v6.quota.fields_unavailable", 30000);
+                reportOnce("quota_unknown", "paperplane.v7.quota.fields_unavailable", 30000);
                 return;
             }
             Integer before = previousRemaining;
             previousRemaining = remaining;
             if (before == null || !before.equals(remaining)) {
                 String change = before == null ? "initial" : (remaining > before ? "increase" : "decrease");
-                report("paperplane.v6.quota remaining=" + remaining + " trend=" + change);
+                report("paperplane.v7.quota remaining=" + remaining + " trend=" + change);
             }
         } catch (Throwable ignored) {
-            reportOnce("body_unparsed_" + kind, "paperplane.v6.body.unparsed kind=" + kind, 30000);
+            reportOnce("body_unparsed_" + kind, "paperplane.v7.body.unparsed kind=" + kind, 30000);
         }
+    }
+    private static String captureLink(Object request) {
+        if (request == null) return "unlinked";
+        String existing = requestLinks.get(request);
+        if (existing != null) return existing;
+        String link = clickContext();
+        if ("none".equals(link)) link = "unlinked";
+        requestLinks.put(request, link);
+        return link;
     }
     private static String clickContext() {
         long age = android.os.SystemClock.elapsedRealtime() - lastClickMs;
