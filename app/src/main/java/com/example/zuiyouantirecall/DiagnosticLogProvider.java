@@ -54,8 +54,9 @@ public final class DiagnosticLogProvider extends ContentProvider {
     }
     @Override public Cursor query(Uri u, String[] p, String s, String[] a, String o) {
         if (!SETTING_URI.equals(u) || getContext() == null || !isAllowedCaller()) return null;
-        MatrixCursor result = new MatrixCursor(new String[] {"enabled"});
-        result.addRow(new Object[] {getContext().getSharedPreferences(PREFS, 0).getBoolean("enabled", false) ? 1 : 0});
+        String key = p != null && p.length == 1 && "paper_enabled".equals(p[0]) ? "paper_enabled" : "enabled";
+        MatrixCursor result = new MatrixCursor(new String[] {key});
+        result.addRow(new Object[] {getContext().getSharedPreferences(PREFS, 0).getBoolean(key, false) ? 1 : 0});
         return result;
     }
     @Override public String getType(Uri u) { return null; }

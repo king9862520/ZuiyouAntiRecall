@@ -22,7 +22,7 @@ public final class MainActivity extends Activity {
         layout.setOrientation(LinearLayout.VERTICAL);
         layout.setPadding(48, 64, 48, 32);
         TextView title = new TextView(this);
-        title.setText("最右防撤回 · 实验测试版");
+        title.setText("最右工具 · V3 诊断版");
         title.setTextSize(22);
         layout.addView(title);
         status = new TextView(this);
@@ -36,6 +36,15 @@ public final class MainActivity extends Activity {
             Toast.makeText(this, checked ? "实验拦截已开启" : "实验拦截已关闭", Toast.LENGTH_SHORT).show();
         });
         layout.addView(toggle);
+        Switch paper = new Switch(this);
+        paper.setText("纸飞机次数诊断（只记录，不修改次数）");
+        paper.setChecked(getSharedPreferences(DiagnosticLogProvider.PREFS, 0).getBoolean("paper_enabled", false));
+        paper.setOnCheckedChangeListener((v, checked) -> {
+            getSharedPreferences(DiagnosticLogProvider.PREFS, 0).edit().putBoolean("paper_enabled", checked).apply();
+            Toast.makeText(this, checked ? "纸飞机诊断已开启，请重启最右" : "纸飞机诊断已关闭", Toast.LENGTH_SHORT).show();
+        });
+        layout.addView(paper);
+
         Button export = new Button(this);
         export.setText("导出 TXT 日志");
         layout.addView(export);
@@ -48,7 +57,7 @@ public final class MainActivity extends Activity {
         });
         TextView info = new TextView(this);
         info.setPadding(0, 32, 0, 0);
-        info.setText("默认关闭拦截。启用后，让测试账号发送文字并撤回，确认原文字是否保留；再导出 TXT。\n\n这是实验版：只尝试阻止 ChatActivity.chatRevoke 的 void 方法调用，可能仍被其他机制撤回。若聊天异常，请立即关闭开关并重启最右。日志不记录聊天正文或用户标识。");
+        info.setText("防撤回 V2 实验功能保持不变。\n\n纸飞机诊断：开启开关、重启最右，然后进入纸飞机详情点击“去聊天”，再导出 TXT。只观察指定网络请求路径和次数不足提示；无法保证覆盖所有网络框架，也无法单凭日志确定服务器具体响应。\n\n不会修改匹配次数或绕过限制。日志不记录聊天正文、完整网址和用户标识。");
         layout.addView(info);
         setContentView(layout);
     }
