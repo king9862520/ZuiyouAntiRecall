@@ -1,12 +1,12 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <queries><package android:name="com.example.zuiyouantirecall" /></queries>
-    <application android:label="最右工具-V3诊断版" android:allowBackup="false">
+    <application android:label="最右防撤回-V17" android:allowBackup="false">
         <activity android:name=".MainActivity" android:exported="true">
             <intent-filter><action android:name="android.intent.action.MAIN"/><category android:name="android.intent.category.LAUNCHER"/></intent-filter>
         </activity>
         <provider android:name=".DiagnosticLogProvider" android:authorities="com.example.zuiyouantirecall.log" android:exported="true" />
         <meta-data android:name="xposedmodule" android:value="true"/>
-        <meta-data android:name="xposeddescription" android:value="最右 7.3.19.2 防撤回实验和纸飞机次数诊断"/>
+        <meta-data android:name="xposeddescription" android:value="最右 7.3.19.2 私聊防撤回与撤回原文保存"/>
         <meta-data android:name="xposedminversion" android:value="82"/>
     </application>
 </manifest>
