@@ -2,6 +2,11 @@ package com.example.zuiyouantirecall;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.widget.ImageView;
+import android.media.MediaPlayer;
+import android.net.Uri;
 import android.content.Intent;
 import android.database.Cursor;
 import android.os.Bundle;
@@ -15,12 +20,13 @@ import android.widget.Toast;
 import org.json.JSONObject;
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.InputStream;
 import java.io.OutputStream;
 import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.Locale;
 
-/** V17: anti-recall + independent module-private archive, no paper-plane feature. */
+/** V18: image and voice snapshot + private recall archive, no paper-plane feature. */
 public final class MainActivity extends Activity {
     private static final int EXPORT = 501;
     private TextView status;
@@ -34,7 +40,7 @@ public final class MainActivity extends Activity {
         scroll.addView(layout);
 
         TextView title = new TextView(this);
-        title.setText("最右防撤回 · V17");
+        title.setText("最右防撤回 · V18（图片＋语音）");
         title.setTextSize(23);
         layout.addView(title);
         status = new TextView(this);
@@ -54,7 +60,7 @@ public final class MainActivity extends Activity {
         layout.addView(toggle);
 
         Button show = new Button(this);
-        show.setText("查看已保存的撤回消息");
+        show.setText("查看撤回保存箱（照片与语音）");
         show.setOnClickListener(v -> showArchive());
         layout.addView(show);
 
@@ -81,11 +87,11 @@ public final class MainActivity extends Activity {
         });
 
         Button wipe = new Button(this);
-        wipe.setText("删除全部本地保存的撤回消息");
+        wipe.setText("删除全部撤回记录和媒体文件");
         layout.addView(wipe);
         wipe.setOnClickListener(v -> new AlertDialog.Builder(this)
-            .setTitle("确认删除所有保存的原文？")
-            .setMessage("此操作不可恢复，不会影响最右本身的聊天数据库。")
+            .setTitle("确认删除全部撤回记录和媒体？")
+            .setMessage("将永久删除模块保存的图片、语音和消息记录，不影响最右原数据库。")
             .setNegativeButton("取消", null)
             .setPositiveButton("确认删除", (dialog, which) -> {
                 int removed = getContentResolver().delete(DiagnosticLogProvider.ARCHIVE_URI, null, null);
@@ -94,13 +100,14 @@ public final class MainActivity extends Activity {
 
         TextView info = new TextView(this);
         info.setPadding(0, 20, 0, 0);
-        info.setText("V17 只处理私聊防撤回与本地保存。\n\n"
-            + "收到撤回通知时，如果原消息还在当前聊天列表中，会先保存到模块私有数据库；"
-            + "重新加载聊天列表时尝试还原相同消息编号的显示。"
-            + "如果服务器已删除整个消息列表项，仍可在上面的保存箱查看副本。\n\n"
-            + "注意：只有 V17 开始成功捕获的消息才能保存；后台撤回、特殊消息或早已消失的消息可能无法恢复。"
-            + "日志不包含正文、账号 ID 或消息 ID。原文仅保存在本机模块数据中，最多保留最近 500 条。"
-            + "请在双方同意的测试聊天中验证，勿分享他人私聊内容。");
+        info.setText("V18 只做私聊防撤回，重点保留照片和语音，不含纸飞机。\n\n"
+            + "图片仅在当前聊天中已加载、能取得有效位图时保存显示副本；可能低于原图画质。"
+            + "语音只从最右已完整缓存且长度可校验的音频中保存副本，不重新请求服务器。"
+            + "请先把照片打开、把语音播放完整，再让双方测试账号进行撤回。\n\n"
+            + "保存箱区分成功和失败：有消息记录不代表媒体文件一定存在。"
+            + "媒体保存于本机模块私有空间；诊断 TXT 不含聊天内容、URL 或用户 ID。"
+            + "V17 已保存的记录会保留并自动升级数据库，不可通过卸载模块来更新。"
+            + "请仅在双方同意的测试聊天中验证。");
         layout.addView(info);
         setContentView(scroll);
     }
@@ -116,21 +123,31 @@ public final class MainActivity extends Activity {
             null, null, null, null)) {
             if (c != null) {
                 while (c.moveToNext()) {
-                    // _id, session_id, message_id, content, msg_type, sent_at, saved_at
+                    // V18 appends: media_kind, media_bytes, media_status
+                    final long sid = c.getLong(1), mid = c.getLong(2);
                     final String body = c.getString(3);
                     long savedAt = c.getLong(6);
-                    String display = readable(body);
+                    final String kind = c.getString(7);
+                    final long bytes = c.getLong(8);
+                    final String mediaStatus = c.getString(9);
+                    String label = "image".equals(kind) ? "照片已保存" :
+                        "voice".equals(kind) ? "语音已保存" : "仅消息记录";
                     Button button = new Button(this);
                     String date = new SimpleDateFormat("MM-dd HH:mm", Locale.CHINA)
                         .format(new Date(savedAt));
-                    String preview = display.length() > 45 ? display.substring(0, 45) + "…" : display;
                     button.setAllCaps(false);
-                    button.setText(date + " · " + preview);
-                    button.setOnClickListener(v -> new AlertDialog.Builder(this)
-                        .setTitle("已保存的撤回消息")
-                        .setMessage(display)
-                        .setPositiveButton("关闭", null)
-                        .show());
+                    button.setText(date + " · " + label + " · " +
+                        ("image".equals(kind) || "voice".equals(kind) ?
+                            bytes / 1024 + " KB" : (mediaStatus == null ? "未保存媒体" : mediaStatus)));
+                    button.setOnClickListener(v -> {
+                        if ("image".equals(kind)) showImage(sid, mid);
+                        else if ("voice".equals(kind)) playVoice(sid, mid);
+                        else new AlertDialog.Builder(this)
+                            .setTitle("只保存了消息记录")
+                            .setMessage("媒体文件未保存，原因：" + mediaStatus +
+                                "\n\n" + readable(body))
+                            .setPositiveButton("关闭", null).show();
+                    });
                     container.addView(button);
                     count++;
                 }
@@ -148,6 +165,59 @@ public final class MainActivity extends Activity {
             .setView(scroll)
             .setPositiveButton("关闭", null)
             .show();
+    }
+
+    private Uri mediaUri(long sid, long mid) {
+        return Uri.parse("content://" + DiagnosticLogProvider.AUTHORITY +
+            "/media/" + sid + "/" + mid);
+    }
+
+    private void showImage(long sid, long mid) {
+        try (InputStream input = getContentResolver().openInputStream(mediaUri(sid, mid))) {
+            if (input == null) throw new IllegalStateException("missing_file");
+            BitmapFactory.Options options = new BitmapFactory.Options();
+            options.inPreferredConfig = Bitmap.Config.RGB_565;
+            Bitmap bitmap = BitmapFactory.decodeStream(input, null, options);
+            if (bitmap == null) throw new IllegalStateException("invalid_image");
+            ImageView image = new ImageView(this);
+            image.setAdjustViewBounds(true);
+            image.setImageBitmap(bitmap);
+            new AlertDialog.Builder(this)
+                .setTitle("已保留的图片副本")
+                .setView(image)
+                .setPositiveButton("关闭", null)
+                .show();
+        } catch (Exception e) {
+            Toast.makeText(this, "无法打开图片：" + e.getClass().getSimpleName(),
+                Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void playVoice(long sid, long mid) {
+        final MediaPlayer player = new MediaPlayer();
+        try {
+            player.setDataSource(this, mediaUri(sid, mid));
+            player.setOnPreparedListener(mp -> mp.start());
+            AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("已保留的语音")
+                .setMessage("正在准备播放本地语音，关闭对话框可停止播放。")
+                .setPositiveButton("停止并关闭", null)
+                .create();
+            dialog.setOnDismissListener(d -> {
+                try { player.release(); } catch (Exception ignored) { }
+            });
+            player.setOnErrorListener((mp, what, extra) -> {
+                Toast.makeText(this, "本地语音无法解码", Toast.LENGTH_SHORT).show();
+                dialog.dismiss();
+                return true;
+            });
+            dialog.show();
+            player.prepareAsync();
+        } catch (Exception e) {
+            player.release();
+            Toast.makeText(this, "无法打开语音：" + e.getClass().getSimpleName(),
+                Toast.LENGTH_LONG).show();
+        }
     }
 
     /** Render common text-message JSON; never place private bodies into logs. */
@@ -185,7 +255,7 @@ public final class MainActivity extends Activity {
         try (OutputStream out = getContentResolver().openOutputStream(data.getData())) {
             if (out == null) throw new IllegalStateException("No output stream");
             if (!file.exists()) {
-                out.write("No V17 anti-recall diagnostic events.\n".getBytes("UTF-8"));
+                out.write("No V18 anti-recall diagnostic events.\n".getBytes("UTF-8"));
             } else {
                 try (FileInputStream in = new FileInputStream(file)) {
                     byte[] buffer = new byte[8192]; int n;

@@ -4,6 +4,22 @@ import android.app.Application;
 import android.content.ContentValues;
 import android.content.Context;
 import android.database.Cursor;
+import android.graphics.Bitmap;
+import android.graphics.drawable.BitmapDrawable;
+import android.graphics.drawable.Drawable;
+import android.widget.ImageView;
+import android.net.Uri;
+import org.json.JSONObject;
+import org.json.JSONArray;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.OutputStream;
+import java.lang.ref.WeakReference;
+import java.util.Collections;
+import java.util.WeakHashMap;
+import java.util.NavigableSet;
+import java.util.HashSet;
+import java.util.Set;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
@@ -17,7 +33,7 @@ import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
-/** V17: private-chat anti-recall only. No paper-plane code, network interception or database mutation. */
+/** V18: private-chat anti-recall and local media snapshots only. No paper-plane code, network interception or database mutation. */
 public final class HookEntry implements IXposedHookLoadPackage {
     private static final String TARGET = "cn.xiaochuankeji.tieba";
     private static final String CHAT_ACTIVITY = "cn.xiaochuankeji.tieba.ui.chat.ChatActivity";
@@ -28,13 +44,23 @@ public final class HookEntry implements IXposedHookLoadPackage {
     private static volatile int historyHookCount = 0;
     private static final AtomicInteger blocked = new AtomicInteger();
     private static final AtomicInteger restored = new AtomicInteger();
+    // ImageHolder bind is the only source of an image association; update on view recycling.
+    private static final Map<Long, WeakReference<ImageView>> imageViews =
+        Collections.synchronizedMap(new HashMap<Long, WeakReference<ImageView>>());
+    private static final Map<ImageView, Long> imageBindings =
+        Collections.synchronizedMap(new WeakHashMap<ImageView, Long>());
+    private static final Set<Long> voiceBindings = Collections.synchronizedSet(new HashSet<Long>());
+    private static volatile int imageHooks = 0;
+    private static volatile int voiceHooks = 0;
+    private static final int MAX_IMAGE_EDGE = 1600;
+    private static final long MAX_AUDIO_BYTES = 12L * 1024L * 1024L;
 
     private static void report(String message) {
         Context ctx = appContext;
         if (ctx == null) return;
         try {
             ContentValues values = new ContentValues();
-            values.put("event", "antirecall.v17." + message);
+            values.put("event", "antirecall.v18." + message);
             ctx.getContentResolver().insert(DiagnosticLogProvider.URI, values);
         } catch (Throwable ignored) { }
     }
@@ -54,13 +80,14 @@ public final class HookEntry implements IXposedHookLoadPackage {
             XposedHelpers.findAndHookMethod(Application.class, "attach", Context.class, new XC_MethodHook() {
                 @Override protected void afterHookedMethod(MethodHookParam p) {
                     appContext = (Context) p.args[0];
-                    report("attach module=v17 revoke_hooks=" + revokeHookCount
+                    report("attach module=v18 revoke_hooks=" + revokeHookCount
                         + " history_hooks=" + historyHookCount);
                 }
             });
-        } catch (Throwable t) { XposedBridge.log("AntiRecall V17 attach failed: " + safeType(t)); }
+        } catch (Throwable t) { XposedBridge.log("AntiRecall V18 attach failed: " + safeType(t)); }
         installRecallBlock(lp.classLoader);
         installHistoryRestore(lp.classLoader);
+        installMediaBinding(lp.classLoader);
     }
 
     /**
@@ -125,6 +152,17 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 DiagnosticLogProvider.ARCHIVE_URI, values);
             if (result == null) return "storage_rejected";
             saved.incrementAndGet();
+            String mediaState;
+            if (isBoundImage(messageId)) {
+                mediaState = captureImage(sessionId, messageId);
+            } else if (voiceBindings.contains(messageId)) {
+                mediaState = captureVoice(sessionId, messageId, content);
+            } else {
+                mediaState = "not_bound";
+            }
+            markMediaStatus(sessionId, messageId, mediaState);
+            report("media_capture kind=" + (isBoundImage(messageId) ? "image" :
+                voiceBindings.contains(messageId) ? "voice" : "unknown") + " result=" + mediaState);
             return "saved";
         } catch (Throwable t) {
             return "failed_" + safeType(t);
@@ -220,6 +258,249 @@ public final class HookEntry implements IXposedHookLoadPackage {
             }
         } catch (Throwable t) { report("archive_query_failed type=" + safeType(t)); }
         return snapshots;
+    }
+
+
+    /** Image/voice binding is read-only. No message bodies or URLs in logs. */
+    private static void installMediaBinding(ClassLoader loader) {
+        imageHooks = hookHolder(loader,
+            "cn.xiaochuankeji.tieba.ui.chat.holder.ImageHolder", true);
+        voiceHooks = hookHolder(loader,
+            "cn.xiaochuankeji.tieba.ui.chat.holder.ChatVoiceHolder", false);
+        report("media_hooks image=" + imageHooks + " voice=" + voiceHooks);
+    }
+
+    private static int hookHolder(ClassLoader loader, String holderName, boolean image) {
+        try {
+            Class<?> cls = Class.forName(holderName, false, loader);
+            int count = 0;
+            for (Method method : cls.getDeclaredMethods()) {
+                Class<?>[] p = method.getParameterTypes();
+                if (!"O".equals(method.getName()) || p.length != 2 ||
+                    !"b81".equals(p[0].getName()) || p[1] != Integer.TYPE) continue;
+                XposedBridge.hookMethod(method, new XC_MethodHook() {
+                    @Override protected void afterHookedMethod(MethodHookParam param) {
+                        if (!enabled() || param.args.length == 0 || param.args[0] == null) return;
+                        try {
+                            long mid = XposedHelpers.getLongField(param.args[0], "k");
+                            if (mid <= 0) return;
+                            if (image) {
+                                Object view = XposedHelpers.getObjectField(param.thisObject, "image");
+                                if (!(view instanceof ImageView)) return;
+                                ImageView iv = (ImageView) view;
+                                imageViews.put(mid, new WeakReference<>(iv));
+                                imageBindings.put(iv, mid);
+                            } else {
+                                voiceBindings.add(mid);
+                            }
+                        } catch (Throwable ignored) { }
+                    }
+                });
+                count++;
+            }
+            return count;
+        } catch (Throwable t) {
+            report("media_hook_error kind=" + (image ? "image" : "voice") +
+                " type=" + safeType(t));
+            return 0;
+        }
+    }
+
+    private static boolean isBoundImage(long mid) {
+        WeakReference<ImageView> ref = imageViews.get(mid);
+        ImageView view = ref == null ? null : ref.get();
+        return view != null && Long.valueOf(mid).equals(imageBindings.get(view));
+    }
+
+    /** Snapshot ONLY the drawable currently bound to this exact message. Never fetch URLs. */
+    private static String captureImage(long sid, long mid) {
+        WeakReference<ImageView> ref = imageViews.get(mid);
+        ImageView view = ref == null ? null : ref.get();
+        if (view == null || !Long.valueOf(mid).equals(imageBindings.get(view))) return "image_recycled";
+        if (!view.isShown()) return "image_not_visible";
+        try {
+            Drawable d = view.getDrawable();
+            if (!(d instanceof BitmapDrawable)) return "image_not_loaded";
+            Bitmap original = ((BitmapDrawable) d).getBitmap();
+            if (original == null || original.isRecycled() || original.getWidth() < 120 ||
+                original.getHeight() < 120) return "image_not_loaded";
+            int w = original.getWidth(), h = original.getHeight();
+            double ratio = Math.min(1.0, (double) MAX_IMAGE_EDGE / Math.max(w, h));
+            Bitmap bounded = ratio == 1.0 ? original :
+                Bitmap.createScaledBitmap(original, Math.max(1, (int)(w * ratio)),
+                    Math.max(1, (int)(h * ratio)), true);
+            Uri write = mediaUri("media_write", sid, mid, "image");
+            boolean encoded = false;
+            try (OutputStream dest = appContext.getContentResolver().openOutputStream(write)) {
+                if (dest == null) return "media_open_failed";
+                encoded = bounded.compress(Bitmap.CompressFormat.JPEG, 90, dest);
+                dest.flush();
+            } finally { if (bounded != original) bounded.recycle(); }
+            if (!encoded) return "image_encode_failed";
+            return commitMedia(sid, mid, "image") ? "image_saved" : "image_commit_failed";
+        } catch (Throwable t) { return "image_" + safeType(t); }
+    }
+
+    /** Audio is saved only if ExoPlayer has a fully cached, length-verified stream. */
+    private static String captureVoice(long sid, long mid, String content) {
+        try {
+            String url = null;
+            // APK-confirmed ct1.b(String,long) parses the chat voice JSON into b41.
+            // b41.a may be a local playable file or ExoPlayer URL; no raw value is logged.
+            try {
+                Class<?> decoder = Class.forName("ct1", false, appContext.getClassLoader());
+                Object voice = XposedHelpers.callStaticMethod(decoder, "b", content, mid);
+                if (voice != null) {
+                    Object rawPath = XposedHelpers.getObjectField(voice, "a");
+                    if (rawPath instanceof String) url = (String)rawPath;
+                }
+            } catch (Throwable ignored) { }
+            if (url == null || url.isEmpty()) url = mediaUrl(new JSONObject(content), 0);
+            if (url == null) return "voice_url_unavailable";
+            File local = secureVoiceFile(url);
+            if (local != null) {
+                if (local.length() < 20 || local.length() > MAX_AUDIO_BYTES)
+                    return "voice_length_unknown";
+                Uri write = mediaUri("media_write", sid, mid, "voice");
+                try (FileInputStream input = new FileInputStream(local);
+                     OutputStream output = appContext.getContentResolver().openOutputStream(write)) {
+                    if (output == null) return "media_open_failed";
+                    byte[] buf = new byte[16384]; int n;
+                    while ((n = input.read(buf)) != -1) output.write(buf, 0, n);
+                    output.flush();
+                }
+                return commitMedia(sid, mid, "voice") ? "voice_saved" : "voice_commit_failed";
+            }
+            if (!(url.startsWith("https://") || url.startsWith("http://")))
+                return "voice_not_local";
+            Class<?> cls = Class.forName(
+                "com.google.android.exoplayer2.ext.okhttp.DataSourceCache", false,
+                appContext.getClassLoader());
+            Object cacheManager = XposedHelpers.callStaticMethod(cls, "getInstance");
+            if (cacheManager == null) return "voice_cache_missing";
+            Object rawSpans = XposedHelpers.callMethod(cacheManager, "getCachedSpans", url);
+            if (!(rawSpans instanceof NavigableSet)) return "voice_cache_missing";
+            @SuppressWarnings("unchecked") NavigableSet<Object> spans = (NavigableSet<Object>)rawSpans;
+            if (spans.isEmpty()) return "voice_cache_missing";
+            // ExoPlayer CacheUtil returns (total length, cached bytes).
+            // Both must match before exporting; partial playback is NOT enough.
+            Object cached = XposedHelpers.callMethod(cacheManager, "getCached", url, null);
+            if (cached == null) return "voice_length_unknown";
+            Object totalRaw = XposedHelpers.getObjectField(cached, "first");
+            Object presentRaw = XposedHelpers.getObjectField(cached, "second");
+            if (!(totalRaw instanceof Number) || !(presentRaw instanceof Number))
+                return "voice_length_unknown";
+            long expected = ((Number) totalRaw).longValue();
+            long available = ((Number) presentRaw).longValue();
+            if (expected < 20 || expected > MAX_AUDIO_BYTES) return "voice_length_unknown";
+            if (available < expected) return "voice_cache_partial";
+            long next = 0;
+            ArrayList<File> files = new ArrayList<>();
+            ArrayList<Long> lengths = new ArrayList<>();
+            for (Object span : spans) {
+                long pos = ((Number)XposedHelpers.getObjectField(span, "position")).longValue();
+                long length = ((Number)XposedHelpers.getObjectField(span, "length")).longValue();
+                File part = (File)XposedHelpers.getObjectField(span, "file");
+                if (pos != next || length <= 0 || part == null ||
+                    !part.isFile() || part.length() < length) return "voice_cache_partial";
+                if (next + length > expected) return "voice_cache_partial";
+                files.add(part); lengths.add(length); next += length;
+                if (next == expected) break;
+            }
+            if (next != expected) return "voice_cache_partial";
+            Uri write = mediaUri("media_write", sid, mid, "voice");
+            try (OutputStream output = appContext.getContentResolver().openOutputStream(write)) {
+                if (output == null) return "media_open_failed";
+                byte[] buf = new byte[16384];
+                for (int i = 0; i < files.size(); i++) {
+                    long remain = lengths.get(i);
+                    try (FileInputStream input = new FileInputStream(files.get(i))) {
+                        while (remain > 0) {
+                            int n = input.read(buf, 0, (int)Math.min(buf.length, remain));
+                            if (n <= 0) return "voice_cache_partial";
+                            output.write(buf, 0, n); remain -= n;
+                        }
+                    }
+                }
+                output.flush();
+            }
+            return commitMedia(sid, mid, "voice") ? "voice_saved" : "voice_commit_failed";
+        } catch (Throwable t) { return "voice_" + safeType(t); }
+    }
+
+
+    /** Only existing local, app-owned files; no arbitrary filesystem path traversal. */
+    private static File secureVoiceFile(String source) {
+        try {
+            String path = source;
+            if (source.startsWith("file://")) path = Uri.parse(source).getPath();
+            if (path == null || !path.startsWith("/")) return null;
+            File file = new File(path).getCanonicalFile();
+            if (!file.isFile()) return null;
+            ArrayList<File> roots = new ArrayList<>();
+            roots.add(appContext.getFilesDir());
+            roots.add(appContext.getCacheDir());
+            File extraFiles = appContext.getExternalFilesDir(null);
+            File extraCache = appContext.getExternalCacheDir();
+            if (extraFiles != null) roots.add(extraFiles);
+            if (extraCache != null) roots.add(extraCache);
+            for (File root : roots) {
+                if (root == null) continue;
+                String trusted = root.getCanonicalPath() + File.separator;
+                if (file.getCanonicalPath().startsWith(trusted)) return file;
+            }
+        } catch (Throwable ignored) { }
+        return null;
+    }
+
+    // Discover URL keys solely inside this already loaded message's own JSON.
+    // Raw addresses are never written to the module log or archive.
+    private static String mediaUrl(Object node, int depth) {
+        if (depth > 5) return null;
+        if (node instanceof JSONObject) {
+            JSONObject obj = (JSONObject)node;
+            java.util.Iterator<String> it = obj.keys();
+            while (it.hasNext()) {
+                String k = it.next();
+                Object value = obj.opt(k);
+                String lower = k.toLowerCase(java.util.Locale.ROOT);
+                if (value instanceof String && (lower.contains("url") || lower.contains("audio") ||
+                    lower.contains("voice") || lower.contains("src") || lower.contains("play"))) {
+                    String candidate = (String)value;
+                    if (candidate.length() < 2048 &&
+                        (candidate.startsWith("https://") || candidate.startsWith("http://")))
+                        return candidate;
+                }
+                if (value instanceof JSONObject || value instanceof JSONArray) {
+                    String result = mediaUrl(value, depth + 1);
+                    if (result != null) return result;
+                }
+            }
+        } else if (node instanceof JSONArray) {
+            JSONArray arr = (JSONArray)node;
+            for (int i = 0; i < Math.min(arr.length(), 12); i++) {
+                String result = mediaUrl(arr.opt(i), depth + 1);
+                if (result != null) return result;
+            }
+        }
+        return null;
+    }
+
+    private static Uri mediaUri(String segment, long sid, long mid, String kind) {
+        return Uri.parse("content://" + DiagnosticLogProvider.AUTHORITY + "/" + segment +
+            "/" + sid + "/" + mid + "/" + kind);
+    }
+    private static boolean commitMedia(long sid, long mid, String kind) {
+        Uri uri = mediaUri("media_commit", sid, mid, kind);
+        return appContext.getContentResolver().update(uri, new ContentValues(), null, null) == 1;
+    }
+    private static void markMediaStatus(long sid, long mid, String status) {
+        try {
+            ContentValues v = new ContentValues();
+            v.put("status", status);
+            appContext.getContentResolver().update(mediaUri("media_status", sid, mid, "set"),
+                v, null, null);
+        } catch (Throwable ignored) { }
     }
 
     private static String safeType(Throwable t) {
